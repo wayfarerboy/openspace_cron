@@ -1,0 +1,371 @@
+<?php
+
+/**
+ * @file
+ * Demonstrates use of the Cron API in Drupal - hook_cron()
+ */
+
+/**
+ * @defgroup cron_example Example: Cron
+ * @ingroup examples
+ * @{
+ * Example using Cron API, including hook_cron() and hook_cron_queue_info().
+ *
+ * This example is part of the Examples for Developers Project
+ * which you can download and experiment with at
+ * http://drupal.org/project/examples
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function openspace_cron_menu() {
+
+  $items['openspace_cron'] = array(
+    'title' => 'OpenSpace Cron',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('openspace_cron_form'),
+    'access callback' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * The form to provide a link to cron.php.
+ */
+function openspace_cron_form($form, &$form_state) {
+  $form['status'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Cron status information'),
+  );
+  $form['status']['intro'] = array(
+    '#markup' => '<div>' . t('The cron example demonstrates hook_cron() and hook_cron_queue_info() processing. If you have administrative privileges you can run cron from this page and see the results.') . '</div>',
+  );
+  $form['status']['last'] = array(
+    '#markup' => '<div>' . t('openspace_cron_cron() will next execute the first time cron runs after %time (%seconds seconds from now)' . '</div>',
+      array(
+        '%time' => date_iso8601(variable_get('openspace_cron_next_execution', time())),
+        '%seconds' => variable_get('openspace_cron_next_execution', time()) - time(),
+      )
+    ),
+  );
+
+  if (user_access('administer site configuration')) {
+    $form['cron_run'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Run cron manually'),
+    );
+    $form['cron_run']['cron_reset'] = array(
+      '#type' => 'checkbox',
+      '#title' => t("Run openspace_cron's cron regardless of whether interval has expired."),
+      '#default_value' => FALSE,
+    );
+    $form['cron_run']['cron_trigger'] = array(
+      '#type' => 'submit',
+      '#value' => t('Run cron now'),
+      '#submit' => array('openspace_cron_form_cron_run_submit'),
+    );
+  }
+
+  $form['configuration'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Configuration of openspace_cron'),
+  );
+  $form['configuration']['openspace_cron_interval'] = array(
+    '#type' => 'select',
+    '#title' => t('Cron interval'),
+    '#description' => t('Time after which openspace_cron will respond to a processing request.'),
+    '#default_value' => variable_get('openspace_cron_interval', 60),
+    '#options' => array(
+      60 => t('1 minute'),
+      300 => t('5 minutes'),
+      600 => t('10 minutes'),
+      900 => t('15 minutes'),
+    ),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Allow user to directly execute cron, optionally forcing it.
+ */
+function openspace_cron_form_cron_run_submit($form, &$form_state) {
+  if (!empty($form_state['values']['cron_reset'])) {
+    variable_set('openspace_cron_next_execution', 0);
+  }
+
+  // We don't usually use globals in this way. This is used here only to
+  // make it easy to tell if cron was run by this form.
+  $GLOBALS['openspace_cron_show_status_message'] = TRUE;
+  if (drupal_cron_run()) {
+    drupal_set_message(t('Cron ran successfully.'));
+  }
+  else {
+    drupal_set_message(t('Cron run failed.'), 'error');
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * hook_cron() is the traditional (pre-Drupal 7) hook for doing "background"
+ * processing. It gets called every time the Drupal cron runs and must decide
+ * what it will do.
+ *
+ * In this example, it does a watchdog() call after the time named in
+ * the variable 'openspace_cron_next_execution' has arrived, and then it
+ * resets that variable to a time in the future.
+ */
+function openspace_cron_cron() {
+  // Default to every minute
+  $interval = variable_get('openspace_cron_interval', 60);
+  // We usually don't want to act every time cron runs (which could be every
+  // minute) so keep a time for the next run in a variable.
+
+  if (time() >= variable_get('openspace_cron_next_execution', 0)) {
+    //openspace_cron_parse_tweets();
+    $eids = explode(',', variable_get('openspace_cron_event_generate', ''));
+    foreach($eids as $eid) {
+      openspace_cron_generate_post($eid);
+    }
+    variable_set('openspace_cron_next_execution', time() + $interval);
+  }
+}
+
+function openspace_cron_parse_tweets() {
+  $refresh = variable_get('openspace_cron_twitter_last_refresh', 0);
+  $last_refresh = db_query('SELECT MAX(last_refresh) FROM {twitter_account}')->fetchField();
+  if ($refresh < $last_refresh) {
+    variable_set('openspace_cron_twitter_last_refresh', $last_refresh);
+    $tweets = db_query('SELECT created_time, screen_name, in_reply_to_screen_name as organiser, text FROM {twitter} WHERE in_reply_to_screen_name IS NOT NULL AND created_time > :refreshed', array(':refreshed'=>$refresh))->fetchAllAssoc('created_time');
+    foreach($tweets as $created => $tweet) {
+      openspace_cron_parse_tweet_text($tweet->organiser, $tweet->screen_name, $tweet->text, $created);
+    }
+  }
+}
+
+function openspace_cron_parse_tweet_text($org_screen_name, $screen_name, $text, $created) {
+  $organiser = $author = $event = null;
+  // Get first hashtag
+  $hashtags = openspace_cron_parse_hashtags($text);
+  if (count($hashtags)) {
+    $result = views_get_view_result('twitter_accounts', 'screen_name_lookup', $org_screen_name);
+    foreach($result as $row) {
+      $organiser = $row->uid;
+    }
+    $result = views_get_view_result('twitter_accounts', 'screen_name_lookup', $screen_name);
+    foreach($result as $row) {
+      $author = $row->uid;
+    }
+    $result = views_get_view_result('active_event_lookup', 'default', $organiser, '2+3');
+    foreach($result as $row) {
+      $event = $row->nid;
+    }
+    if ($organiser && $author && $event) {
+      $event = node_load($event);
+      $author = user_load($author);
+      $statuses = field_get_items('node', $event, 'field_status');
+      if (count($statuses)) {
+        $status = $statuses[0]['tid'];
+        // Remove organiser's username from start of tweet
+        $text = openspace_cron_remove_from_start(array("$org_screen_name"), $text, '@');
+        // Remove hashtag from start of string
+        $text = openspace_cron_remove_from_start($hashtags, $text, '#');
+        // If it's a question, send it to the Create a Question rule component
+        if (in_array('question', $hashtags)) {
+          if ($status == 2) {
+            openspace_cron_create_question_node($author, $event, $text);
+          }
+        } else if ($status == 3) {
+          $CONCLUSION = FALSE;
+          // If it has the conclusion hashtag, set it to be a conclusion post
+          if (in_array('conclusion', $hashtags)) {
+            unset($hashtags[array_search('conclusion', $hashtags)]);
+            $CONCLUSION = TRUE;
+          }
+          if (count($hashtags)) {
+            $question = 0;
+            // Find a matching discussion hashtag in the current event
+            foreach($hashtags as $hashtag) {
+              $result = views_get_view_result('question_sequence', 'hashtags', $event->nid, $hashtag);
+              if (count($result)) {
+                $question = $result[0]->nid;
+                break;
+              }
+            }
+            if ($question > 0) {
+              $question = node_load($question);
+              $qstatuses = field_get_items('node', $question, 'field_q_status');
+              if (count($qstatuses) > 0) {
+                $qsTid = $qstatuses[0]['tid'];
+                if ($qsTid > 5 && $qsTid < 8) {
+                  if ($qstatuses[0]['tid'] == 7) {
+                    $CONCLUSION = TRUE;
+                  }
+                  openspace_cron_create_post_node($author, $event, $question, $text, $CONCLUSION); 
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function openspace_cron_parse_hashtags($text) {
+  preg_match_all("/#(\\w+)/", $text, $matches);
+  $hashtags = $matches[1];
+  if (count($hashtags)) {
+    foreach($hashtags as $i => $hashtag) {
+      $hashtags[$i] = strtolower($hashtag);
+    }
+    return $hashtags;
+  }
+  return array();
+}
+
+function openspace_cron_remove_from_start($needle, $haystack, $prefix='') {
+  $haystack = trim($haystack);
+  $ALTERED = FALSE;
+  $new_needle = $needle;
+  foreach($needle as $keyword) {
+    $keyword = $prefix.$keyword;
+    if (strpos($haystack, $keyword) == 0) {
+      $haystack = trim(substr($haystack, strlen($keyword)));
+      unset($new_needle[array_search($keyword, $new_needle)]);
+      $ALTERED = TRUE;
+    }
+  }
+  //if ($ALTERED && count($new_needle)) {
+  //  $haystack = openspace_cron_remove_from_start($new_needle, $haystack);
+  //}
+  return $haystack;
+}
+
+function openspace_cron_generate_posts($event) {
+  $eids = explode(',', variable_get('openspace_cron_event_generate', ''));
+  $eids[] = $event->nid;
+  $nid = variable_set('openspace_cron_event_generate', implode(',', $eids));
+}
+
+function openspace_cron_ungenerate_posts($event) {
+  openspace_cron_remove_event($event->nid);
+}
+
+function openspace_cron_remove_event($eid) {
+  $eids = explode(',', variable_get('openspace_cron_event_generate', ''));
+  unset($eids[array_search($eid, $eids)]);
+  $nid = variable_set('openspace_cron_event_generate', implode(',', $eids));
+}
+
+function openspace_cron_generate_post($eid) {
+  $event = node_load($eid);
+  if (!$event) {
+    openspace_cron_remove_event($eid);
+  } else {
+    $status = field_get_items('node', $event, 'field_status');
+    if ($status[0]['tid'] == 3) {
+      global $user;
+      $user = user_load(1);
+
+      // Load flags
+      $conclusion_flag = flag_get_flag('conclusion');
+
+      // Choose a random question from selection
+      $results = views_get_view_result('question_sequence', 'page', $event->nid);
+      if (count($results) > 0) {
+        syslog(LOG_INFO, '[cron] '.count($results).' active questions for '.$event->title.' ('.$event->nid.')');
+        
+        $row = $results[mt_rand(0, count($results)-1)];
+        $question = node_load($row->nid);
+
+        // If question is in conclusion mode...
+        $q_status = field_get_items('node', $question, 'field_q_status');
+        if ($q_status[0]['tid'] == 7) {
+          $u = user_load($question->uid);
+          openspace_cron_generate_single_post($u, $event, $question, '', $conclusion_flag);
+        } else {
+          openspace_cron_generate_single_post(NULL, $event, $question, '');
+        }
+      } else {
+        syslog(LOG_ERR, '[cron] '.count($results).' active questions for '.$event->title.' ('.$event->nid.') - why is that?!');
+      }
+    }
+  }
+}
+
+function openspace_cron_generate_single_post($user, $event, $question, $node_text, $conclusion = NULL, $num = 1) {
+  for($i = 0; $i < $num; $i++) {
+    $nid = openspace_cron_create_post_node($user, $event, $question, $node_text, $conclusion);
+    if ($conclusion) {
+      $conclusion->flag('flag', $nid, $user, TRUE);
+    }
+  }
+}
+
+function openspace_cron_create_post_node($user, $event, $question, $node_text, $conclusion = NULL) {
+  if ($node_text == '') {
+    module_load_include('inc', 'devel_generate');
+    $node_text = substr(devel_create_greeking(mt_rand(1, 140 / 6), FALSE), 0, 140);
+  }
+
+  $node = new StdClass();
+  $node->title = $node_text;
+  $node->type = 'post';
+  $node->language = LANGUAGE_NONE;
+  node_object_prepare($node);
+
+  if ($user != NULL && ($user->uid || $conclusion)) {
+    $node->uid = $user->uid;
+  } else {
+    $tids = field_get_items('node', $event, 'field_participants');
+    $tid = mt_rand(0, count($tids) - 1);
+    syslog(LOG_INFO, '[cron] Found '.count($tids).' participants for event '.$event->nid);
+    $term = taxonomy_term_load($tids[$tid]['tid']);
+    $uids = field_get_items('taxonomy_term', $term, 'field_users');
+    $node->uid = $uids[0]['uid'];
+  }
+  $node->field_body[$node->language][0]['value'] = $node_text;
+  $node->field_body[$node->language][0]['format'] = 'tweet_with_preview_';
+  $node->field_question_ref[$node->language][0]['nid'] = $question->nid;
+  $node->field_event[$node->language][0]['nid'] = $event->nid;
+
+  node_save_action($node);
+  $nid = db_query('SELECT MAX(nid) FROM {node} WHERE type = :type', array(':type'=>'post'))->fetchCol('nid');
+  return $nid[0];
+}
+
+function openspace_cron_create_question_node($user, $event, $node_text) {
+  if ($node_text == 'random') {
+    module_load_include('inc', 'devel_generate');
+    $node_text = substr(devel_create_greeking(mt_rand(1, 140 / 6), FALSE), 0, 140);
+  }
+
+  $node = new StdClass();
+  $node->title = $node_text;
+  $node->type = 'question';
+  $node->language = LANGUAGE_NONE;
+  node_object_prepare($node);
+
+  if ($user->uid) {
+    $node->uid = $user->uid;
+  } else {
+    $tids = field_get_items('node', $event, 'field_participants');
+    $tid = mt_rand(0, count($tids) - 1);
+    $term = taxonomy_term_load($tids[$tid]['tid']);
+    $uids = field_get_items('taxonomy_term', $term, 'field_users');
+    $node->uid = $uids[0]['uid'];
+  }
+  $node->field_event[$node->language][0]['nid'] = $event->nid;
+
+  node_save_action($node);
+  $nid = db_query('SELECT MAX(nid) FROM {node} WHERE type = :type', array(':type'=>'post'))->fetchCol('nid');
+  return $nid[0];
+}
+
+/**
+ * @} End of "defgroup openspace_cron".
+ */

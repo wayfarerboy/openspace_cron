@@ -1,0 +1,12 @@
+name = OpenSpace Twitter tweet to node conversion
+description = Convert new tweets to OpenSpace questions and posts
+package = Generamics
+core = 7.x
+files[] = openspace_cron.test
+
+; Information added by drupal.org packaging script on 2013-06-12
+version = "7.x-1.x-dev"
+core = "7.x"
+project = "Generamics"
+datestamp = "1370999542"
+
